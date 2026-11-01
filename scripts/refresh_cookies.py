@@ -16,12 +16,22 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 
+# 强制使用 IPv4 连接，避免双栈网络下 AAAA 记录解析后的 IPv6 握手黑洞/超时
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Origin": "https://glados.cloud",

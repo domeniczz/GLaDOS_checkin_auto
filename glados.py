@@ -4,11 +4,26 @@ import hmac
 import json
 import os
 import re
+import socket
 import sys
 import time
 from urllib.parse import urlparse
 
 import requests
+
+# -------------------------------------------------------------------------------------------
+# 强制 Python 全局使用 IPv4 连接
+# 解决 GitHub Actions / Azure Ubuntu 24.04 双栈 Runner 解析 AAAA 记录后 IPv6 握手黑洞、
+# 导致 requests 对 glados.cloud / glados.rocks 出现 20s ReadTimeout 的根本问题。
+# -------------------------------------------------------------------------------------------
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 # -------------------------------------------------------------------------------------------
 # 社区方案移植（2026-10，参考 lankerr/2026-glados-checkin 与 Devilstore/Glados-Railgun-checkin）
@@ -188,19 +203,28 @@ class GladosClient:
             self.evidence.append(f"{domain} 返回非 JSON")
             return None
 
-    def status(self):
-        """返回 (是否已认证, 状态数据)。按域名顺序回退，只有 code=0 且带 email 才算成功。"""
+    def status(self, attempts=3, delay=10):
+        """返回 (是否已认证, 状态数据)。按域名顺序回退，只有 code=0 且带 email 才算成功。遇到网络异常支持重试。"""
         last = None
-        for domain in self._order():
-            body = self._send(domain, "GET", "/api/user/status")
-            if body is None:
-                continue
-            last = body
-            data = body.get("data") if isinstance(body.get("data"), dict) else {}
-            if body.get("code") == 0 and data.get("email"):
-                self.domain = domain
-                return True, data
-            self.evidence.append(f"{domain} code={body.get('code')} {body.get('message', '')}".strip())
+        for attempt in range(1, max(1, attempts) + 1):
+            has_network_err = False
+            for domain in self._order():
+                body = self._send(domain, "GET", "/api/user/status")
+                if body is None:
+                    has_network_err = True
+                    continue
+                last = body
+                data = body.get("data") if isinstance(body.get("data"), dict) else {}
+                if body.get("code") == 0 and data.get("email"):
+                    self.domain = domain
+                    return True, data
+                self.evidence.append(f"{domain} code={body.get('code')} {body.get('message', '')}".strip())
+            # 如果全是明确的业务拒绝 (如 code=-2)，不再重复重试
+            if not has_network_err:
+                break
+            if attempt < attempts:
+                log(f"⚠️ 账号状态查询第 {attempt}/{attempts} 次遇网络异常，{delay} 秒后重试")
+                time.sleep(max(0, delay))
         return False, (last or {})
 
     def points(self):
@@ -380,7 +404,7 @@ def diagnose(cookies, user_agent):
     for idx, cookie in enumerate(cookies, 1):
         kind = cookie_kind(cookie)
         client = GladosClient(cookie, user_agent)
-        ok, data = client.status()
+        ok, data = client.status(attempts=2, delay=5)
         if ok:
             log(f"✅ 账号[{idx}] 登录态有效（会话类型 {kind or '未知'}，域名 {client.domain}）")
         else:
@@ -403,27 +427,45 @@ def main():
     send_content = ""
     has_warning = False
     has_cookie_expired = False
+    has_network_failure = False
     attempts = int(os.environ.get("CHECKIN_MAX_ATTEMPTS", "3"))
     delay = int(os.environ.get("CHECKIN_RETRY_DELAY_SECONDS", "60"))
 
     for idx, cookie in enumerate(cookies, 1):
         kind = cookie_kind(cookie)
         client = GladosClient(cookie, user_agent)
-        authed, data = client.status()
+        authed, data = client.status(attempts=attempts, delay=min(15, delay))
 
         if not authed:
-            has_cookie_expired = True
             evidence = "; ".join(client.evidence[-3:]) or "无有效响应"
-            log(f"账号[{idx}]----结果--Cookie已失效(鉴权失败)---- {evidence}")
-            send_content += "\n".join(
-                [
-                    f"🚨 账号[{idx}]：登录态已失效（会话类型 {kind or '未知'}）",
-                    f"❌ 鉴权证据：{evidence}",
-                    "🛠 处置：在浏览器登录 glados.cloud（旧号可能已迁移到 railgun.info），"
-                    "从成功的 /api/user/status 请求复制完整 Cookie（需含 gld:sess 与 gld:sess.sig）"
-                    "及同浏览器 User-Agent，执行 `python3 scripts/refresh_cookies.py --cookie1 ... --user-agent ...`。",
-                ]
-            ) + "\n\n"
+            # 只有在主站 (glados.cloud / glados.rocks) 明确返回 code=-2 时才判为 Cookie 失效
+            # 排除由于主站超时降级到未迁移的 railgun.info 报 No permission 的误报
+            is_cookie_expired = any(
+                ("glados.cloud" in ev or "glados.rocks" in ev) and ("code=-2" in ev or "没有权限" in ev)
+                for ev in client.evidence
+            )
+            if is_cookie_expired:
+                has_cookie_expired = True
+                log(f"账号[{idx}]----结果--Cookie已失效(鉴权失败)---- {evidence}")
+                send_content += "\n".join(
+                    [
+                        f"🚨 账号[{idx}]：登录态已失效（会话类型 {kind or '未知'}）",
+                        f"❌ 鉴权证据：{evidence}",
+                        "🛠 处置：在浏览器登录 glados.cloud（旧号可能已迁移到 railgun.info），"
+                        "从成功的 /api/user/status 请求复制完整 Cookie（需含 gld:sess 与 gld:sess.sig）"
+                        "及同浏览器 User-Agent，执行 `python3 scripts/refresh_cookies.py --cookie1 ... --user-agent ...`。",
+                    ]
+                ) + "\n\n"
+            else:
+                has_network_failure = True
+                log(f"账号[{idx}]----结果--网络/服务异常(未判失效)---- {evidence}")
+                send_content += "\n".join(
+                    [
+                        f"⚠️ 账号[{idx}]：登录状态检查网络异常（未判失效）",
+                        f"❌ 证据：{evidence}",
+                        "ℹ️ 可能是 GitHub Runner 出口网络抖动，后续自动重试，无需重置 Secret。",
+                    ]
+                ) + "\n\n"
             continue
 
         email = data.get("email", "")
@@ -510,6 +552,8 @@ def main():
 
     if has_cookie_expired:
         notice_title = "🚨 GLaDOS 签到报警：Cookie 已失效！"
+    elif has_network_failure:
+        notice_title = "⚠️ GLaDOS 签到网络异常通知"
     elif has_warning:
         notice_title = "⚠️ GLaDOS 续期预警通知"
     else:
@@ -524,7 +568,7 @@ def main():
     else:
         send_telegram(notice_title, send_content, os.environ.get("TG_DIGEST_BOT_TOKEN", ""))
 
-    return 1 if has_cookie_expired else 0
+    return 1 if (has_cookie_expired or has_network_failure) else 0
 
 
 if __name__ == "__main__":
